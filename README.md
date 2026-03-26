@@ -1,3 +1,5 @@
+[中文](README.md) | [English](README_en.md)
+
 # AndProxy – Android Binder 与系统调用拦截库
 
 AndProxy 是一款 Android 底层拦截库，通过 **GOT Hook** 劫持 `libbinder.so` 中的 `ioctl` 调用，实现对 Binder 事务的拦截与修改；同时基于 **Seccomp** 用户态通知机制拦截指定系统调用，并在 Java 层提供统一的回调接口。该库适用于安全研究、隐私保护、自动化测试等场景。
