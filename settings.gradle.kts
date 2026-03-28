@@ -21,5 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "AndProxyDemo"
 include(":app")
-include(":GlossHook")
 include(":AndProxy")

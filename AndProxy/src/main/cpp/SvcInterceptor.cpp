@@ -7,7 +7,8 @@
 #include <pthread.h>
 #include <cerrno>
 #include <linux/filter.h>
-#include <asm-generic/unistd.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include "seccomp_hook.h"
 #include "log.h"
@@ -299,6 +300,18 @@ extern "C" JNIEXPORT jint JNICALL Java_com_gumuluo_proxy_SvcInterceptor_init
 }
 
 // ---------------------------------------------------------------------------
+// 压入文件（保持不变）
+extern "C" JNIEXPORT jint JNICALL Java_com_gumuluo_proxy_SvcInterceptor_addFile(JNIEnv *env, jclass clazz, jobject request, jstring path) {
+    auto *req = (hook_request_t*)env->GetLongField(request, hookRequestPtrField);
+    const char *path_str = env->GetStringUTFChars(path, nullptr);
+    if (!path_str) return -1;
+    int fd = openat(AT_FDCWD, path_str, req->args[2], req->args[3]);
+    int ret = seccomp_hook_add_fd(req, fd, 0);
+    env->ReleaseStringUTFChars(path, path_str);
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
 // 内存读写（保持不变）
 extern "C" JNIEXPORT jlong JNICALL Java_com_gumuluo_proxy_SvcInterceptor_readMemory
         (JNIEnv *env, jclass clazz, jint pid, jlong remoteAddr, jbyteArray buffer, jint offset, jint len) {
@@ -392,10 +405,4 @@ extern "C" JNIEXPORT void JNICALL Java_com_gumuluo_proxy_HookResponse_setVal
     jlong ptr = env->GetLongField(obj, hookResponsePtrField);
     auto *resp = (hook_response_t*)ptr;
     resp->val = val;
-}
-
-extern "C"
-JNIEXPORT jint JNICALL
-Java_com_gumuluo_proxy_SvcInterceptorTest_getpid(JNIEnv *env, jobject thiz) {
-    return syscall(__NR_getpid);
 }

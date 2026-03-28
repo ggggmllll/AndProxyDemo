@@ -136,7 +136,26 @@ size_t get_cmd_data_size(uint32_t cmd, int is_read) {
 std::string get_transaction_name(JNIEnv* env, const char* class_name, int code) {
     std::string result;
 
-    // 将点号分隔的类名转换为斜杠分隔（已在外部处理，但这里不再转换）
+    // 类名合法性检查：只允许字母、数字、'/','$','_'
+    auto is_valid_class_name = [](const char* name) -> bool {
+        if (!name || *name == '\0') return false;
+        for (const char* p = name; *p; ++p) {
+            unsigned char ch = *p;
+            if (ch <= 0x20 || ch == ':' || ch == ';' || ch == '[' || ch == '(' || ch == ')') {
+                return false;
+            }
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                  (ch >= '0' && ch <= '9') || ch == '/' || ch == '$' || ch == '_')) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (!is_valid_class_name(class_name)) {
+        return result;
+    }
+
     jclass targetClass = env->FindClass(class_name);
     if (targetClass == nullptr) {
         env->ExceptionClear();  // 清除异常，避免崩溃
@@ -178,7 +197,6 @@ std::string get_transaction_name(JNIEnv* env, const char* class_name, int code) 
         // 匹配前缀 "TRANSACTION_"
         const char* prefix = "TRANSACTION_";
         if (strncmp(name, prefix, 12) == 0) {
-            // 使用 JNI 直接获取静态 int 字段值，避免 Java 反射权限问题
             jfieldID fieldID = env->GetStaticFieldID(targetClass, name, "I");
             if (fieldID != nullptr) {
                 jint value = env->GetStaticIntField(targetClass, fieldID);
@@ -190,8 +208,7 @@ std::string get_transaction_name(JNIEnv* env, const char* class_name, int code) 
                     break;
                 }
             } else {
-                // 清除可能的异常（如字段不是 int 类型）
-                env->ExceptionClear();
+                env->ExceptionClear();  // 清除可能的异常
             }
         }
 
@@ -222,7 +239,6 @@ std::string get_server_name(const binder_transaction_data* txn) {
         result.reserve(len);
         for (int32_t i = 0; i < len; ++i) {
             uint16_t ch = name16[i];
-            // 简单 UTF-16 到 UTF-8 转换
             if (ch < 0x80) {
                 result.push_back(static_cast<char>(ch));
             } else if (ch < 0x800) {
@@ -237,45 +253,40 @@ std::string get_server_name(const binder_transaction_data* txn) {
         return result;
     };
 
-    // 首先寻找 "TSYS" 标志（即 flat_binder_object.hdr.type == BINDER_TYPE_BINDER）
-    // 注意：TSYS 在内存中是小端序：'T'=0x54, 'S'=0x53, 'Y'=0x59, 'S'=0x53 => 0x53595354
-    // 但在缓冲区中是按字节存储的，所以直接比较 4 个字节。
-    const uint32_t TSYS_MAGIC = 0x54535953;  // "TSYS" 的 ASCII 值
-    // 搜索范围：从偏移 8 开始（跳过 Parcel 头部），到 size - 8 结束
+    // 服务名合法性检查：只允许字母、数字、点、下划线、美元符号
+    auto is_valid_name = [](const std::string& s) -> bool {
+        if (s.empty()) return false;
+        for (char c : s) {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '$')) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // 首先寻找 "TSYS" 标志（flat_binder_object.hdr.type == BINDER_TYPE_BINDER）
+    const uint32_t TSYS_MAGIC = 0x54535953;  // "TSYS"
     for (size_t offset = 8; offset + 8 <= size; ++offset) {
         if (*(uint32_t*)(base + offset) == TSYS_MAGIC) {
-            // 找到 TSYS，紧接着 4 个字节是长度字段
             size_t len_pos = offset + 4;
             if (len_pos + 4 > size) continue;
             int32_t nameLen = *(int32_t*)(base + len_pos);
-            // 长度合理性检查：服务名通常较长（>3），且不超过 512
             if (nameLen > 3 && nameLen <= 256) {
-                // 提取字符串
                 std::string candidate = extract_utf16(len_pos, nameLen);
-                // 进一步验证：服务名通常以 "android." 开头，或以 "." 分隔的包名
-                // 但为了通用，只检查是否包含可打印 ASCII 字符，且没有控制字符
-                if (!candidate.empty()) {
-                    // 可选：检查是否包含 '.' 或常见服务名特征
-                    bool valid = true;
-                    for (char c : candidate) {
-                        if (c < 0x20 || c > 0x7E) {
-                            valid = false;
-                            break;
-                        }
-                    }
-                    if (valid && candidate.find('.') != std::string::npos) {
-                        return candidate;  // 返回第一个找到的服务名
-                    }
+                if (!candidate.empty() && is_valid_name(candidate) &&
+                    candidate.find('.') != std::string::npos) {
+                    return candidate;
                 }
             }
         }
     }
 
-    // 如果没找到，回退到原来的模糊搜索（但可以增强长度限制）
+    // 回退到模糊搜索
     for (size_t offset = 0; offset + 6 <= size; ++offset) {
         const int32_t* len_ptr = reinterpret_cast<const int32_t*>(base + offset);
         int32_t nameLen = *len_ptr;
-        if (nameLen <= 3 || nameLen > 256) continue;  // 长度至少 4 个字符
+        if (nameLen <= 3 || nameLen > 256) continue;
         size_t str_bytes = static_cast<size_t>(nameLen) * 2;
         if (offset + 4 + str_bytes > size) continue;
 
@@ -293,22 +304,10 @@ std::string get_server_name(const binder_transaction_data* txn) {
         }
         if (!valid) continue;
 
-        std::string result;
-        result.reserve(nameLen);
-        for (int32_t i = 0; i < nameLen; ++i) {
-            uint16_t ch = name16[i];
-            if (ch < 0x80) {
-                result.push_back(static_cast<char>(ch));
-            } else if (ch < 0x800) {
-                result.push_back(static_cast<char>(0xC0 | (ch >> 6)));
-                result.push_back(static_cast<char>(0x80 | (ch & 0x3F)));
-            } else {
-                result.push_back(static_cast<char>(0xE0 | (ch >> 12)));
-                result.push_back(static_cast<char>(0x80 | ((ch >> 6) & 0x3F)));
-                result.push_back(static_cast<char>(0x80 | (ch & 0x3F)));
-            }
+        std::string result = extract_utf16(offset, nameLen);
+        if (is_valid_name(result)) {
+            return result;
         }
-        return result;
     }
 
     return "";

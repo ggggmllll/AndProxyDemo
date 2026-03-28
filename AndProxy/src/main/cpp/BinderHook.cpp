@@ -1,11 +1,12 @@
 #include "BinderHook.h"
 #include "binder_proxy.h"
 #include "log.h"
-#include "Gloss.h"
 
+#include <elf.h>
 #include <thread>
 #include <utility>
 #include <sys/mman.h>
+#include <bits/sysconf.h>
 
 thread_local BinderHook::TxnContext BinderHook::txnContext_;
 
@@ -24,50 +25,178 @@ BinderHook::~BinderHook() {
     addrMap_.clear();
 }
 
+// 通过 /proc/self/maps 获取库基址
+static uintptr_t get_library_base(const char *libname) {
+    char line[512];
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) {
+        LOGE("Failed to open /proc/self/maps: %s", strerror(errno));
+        return 0;
+    }
+
+    uintptr_t base = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char *path = strchr(line, '/');
+        if (path) {
+            if (strstr(path, libname) != NULL) {
+                char *dash = strchr(line, '-');
+                if (dash) {
+                    *dash = '\0';
+                    base = strtoull(line, NULL, 16);
+                    LOGD("Found library %s at base 0x%lx", libname, base);
+                    break;
+                } else {
+                    LOGE("Invalid map line (no dash): %s", line);
+                }
+            }
+        }
+    }
+    fclose(fp);
+    if (base == 0) {
+        LOGE("Library %s not found in /proc/self/maps", libname);
+    }
+    return base;
+}
+
+// 从动态段中获取指定类型的信息（返回偏移量，需加 base）
+static uintptr_t get_dynamic_info_offset(const Elf64_Dyn *dyn, int64_t tag) {
+    for (; dyn->d_tag != DT_NULL; ++dyn) {
+        if (dyn->d_tag == tag) {
+            return dyn->d_un.d_ptr;
+        }
+    }
+    return 0;
+}
+
+// 根据函数名在指定库中查找 GOT 条目地址
+static uintptr_t find_got_entry(const char *libname, const char *funcname) {
+    uintptr_t base = get_library_base(libname);
+    if (base == 0) {
+        LOGE("Failed to get base address for %s", libname);
+        return 0;
+    }
+
+    // 读取 ELF 头
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr*)base;
+    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
+        ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+        ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
+        ehdr->e_ident[EI_MAG3] != ELFMAG3) {
+        LOGE("Invalid ELF header at base 0x%lx", base);
+        return 0;
+    }
+    LOGD("Valid ELF header at base 0x%lx", base);
+
+    // 找到 PT_DYNAMIC 程序头
+    Elf64_Phdr *phdr = (Elf64_Phdr*)(base + ehdr->e_phoff);
+    Elf64_Dyn *dyn = NULL;
+    for (int i = 0; i < ehdr->e_phnum; ++i) {
+        if (phdr[i].p_type == PT_DYNAMIC) {
+            dyn = (Elf64_Dyn*)(base + phdr[i].p_vaddr);
+            LOGD("Found PT_DYNAMIC at offset 0x%lx, vaddr 0x%lx",
+                 phdr[i].p_offset, phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) {
+        LOGE("No PT_DYNAMIC segment found");
+        return 0;
+    }
+
+    // 获取动态段中的关键信息（偏移量）
+    uintptr_t symtab_off = get_dynamic_info_offset(dyn, DT_SYMTAB);
+    uintptr_t strtab_off = get_dynamic_info_offset(dyn, DT_STRTAB);
+    uintptr_t relplt_off = get_dynamic_info_offset(dyn, DT_JMPREL);
+    size_t relplt_size = get_dynamic_info_offset(dyn, DT_PLTRELSZ);
+    uintptr_t pltgot_off = get_dynamic_info_offset(dyn, DT_PLTGOT);
+
+    if (!symtab_off) {
+        LOGE("DT_SYMTAB not found");
+        return 0;
+    }
+    if (!strtab_off) {
+        LOGE("DT_STRTAB not found");
+        return 0;
+    }
+    if (!relplt_off) {
+        LOGE("DT_JMPREL not found");
+        return 0;
+    }
+    if (!relplt_size) {
+        LOGE("DT_PLTRELSZ is zero");
+        return 0;
+    }
+    if (!pltgot_off) {
+        LOGE("DT_PLTGOT not found");
+        return 0;
+    }
+
+    // 计算实际内存地址（基址 + 偏移）
+    Elf64_Sym *symtab = (Elf64_Sym*)(base + symtab_off);
+    const char *strtab = (const char*)(base + strtab_off);
+    Elf64_Rela *relplt = (Elf64_Rela*)(base + relplt_off);
+    uintptr_t pltgot = base + pltgot_off;
+
+    LOGD("symtab=0x%lx (offset 0x%lx), strtab=0x%lx, relplt=0x%lx, relplt_size=%zu, pltgot=0x%lx",
+         (uintptr_t)symtab, symtab_off, (uintptr_t)strtab, (uintptr_t)relplt, relplt_size, pltgot);
+
+    // 遍历 .rel.plt 重定位表
+    size_t num_rel = relplt_size / sizeof(Elf64_Rela);
+    LOGD("Number of relocations in .rel.plt: %zu", num_rel);
+    for (size_t i = 0; i < num_rel; ++i) {
+        uint32_t sym_idx = ELF64_R_SYM(relplt[i].r_info);
+        const char *sym_name = strtab + symtab[sym_idx].st_name;
+        if (strcmp(sym_name, funcname) == 0) {
+            uintptr_t got_entry = base + relplt[i].r_offset;  // r_offset 也是偏移，需加基址
+            LOGD("Found GOT entry for %s at 0x%lx (r_offset=0x%lx)",
+                 funcname, got_entry, relplt[i].r_offset);
+            return got_entry;
+        }
+    }
+
+    LOGE("Function %s not found in .rel.plt", funcname);
+    return 0;
+}
+
 static void got_hook(uintptr_t got_addr, void *new_func, void **old_func) {
     void **got_ptr = (void**)got_addr;
     void *orig = *got_ptr;
 
     long page_size = sysconf(_SC_PAGESIZE);
-    uintptr_t page_start = got_addr & ~(page_size - 1);
-    if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE) == -1) {
-        LOGE("mprotect failed: %s", strerror(errno));
+    if (page_size <= 0) {
+        LOGE("sysconf(_SC_PAGESIZE) failed: %s", strerror(errno));
         return;
     }
 
+    uintptr_t page_start = got_addr & ~(page_size - 1);
+    LOGD("Got address 0x%lx, page_start 0x%lx, page_size %ld",
+         got_addr, page_start, page_size);
+
+    if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE) == -1) {
+        LOGE("mprotect (write) failed: %s", strerror(errno));
+        return;
+    }
+
+    // 执行 GOT 替换
     *got_ptr = new_func;
-    mprotect((void*)page_start, page_size, PROT_READ);
+    LOGD("GOT entry at 0x%lx changed from %p to %p", got_addr, orig, new_func);
+
+    if (mprotect((void*)page_start, page_size, PROT_READ) == -1) {
+        LOGE("mprotect (read-only) failed: %s", strerror(errno));
+        // 即使恢复失败，hook 已生效，只打印警告
+    }
+
     if (old_func) *old_func = orig;
 }
 
 void BinderHook::init(JavaVM* vm) {
-    GHandle handle = GlossOpen("libbinder.so");
-    if (!handle) {
-        LOGE("GlossOpen failed");
+    uintptr_t got_entry = find_got_entry("libbinder.so", "ioctl");
+    if (!got_entry) {
+        LOGE("Failed to find GOT entry for ioctl");
         return;
     }
 
-    uintptr_t *got_addrs = NULL;
-    size_t got_count = 0;
-    if (!GlossGot(handle, "ioctl", &got_addrs, &got_count)) {
-        LOGE("GlossGot failed");
-        GlossClose(handle, true);
-        return;
-    }
-
-    if (got_count == 0) {
-        LOGE("No GOT entry found for ioctl");
-        free(got_addrs);
-        GlossClose(handle, true);
-        return;
-    }
-
-    LOGI("Found %zu GOT entries for ioctl", got_count);
-    LOGI("GOT entry address: %p, target: %p", (void*)got_addrs[0], (void*)ioctl_proxy);
-
-    got_hook((uintptr_t) got_addrs[0], (void *) ioctl_proxy, NULL);
-
-    free(got_addrs);
+    got_hook(got_entry, (void*) ioctl_proxy, NULL);
     jvm_ = vm;
     JNIEnv* env;
     if (jvm_->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {

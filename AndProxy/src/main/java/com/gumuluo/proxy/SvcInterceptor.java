@@ -18,6 +18,7 @@ public class SvcInterceptor {
     public static native int init(int[] syscallList);
     public static native long readMemory(int pid, long remoteAddr, byte[] buffer, int offset, int len);
     public static native long writeMemory(int pid, long remoteAddr, byte[] buffer, int offset, int len);
+    public static native int addFile(HookRequest request, String path);
 
     // 注册钩子（Java 层实现）
     public static void registerHook(int syscallNr, Callback callback) {

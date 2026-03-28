@@ -10,10 +10,8 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         BinderProxy.cpp
 )
 
-find_package(GlossHook REQUIRED CONFIG)
-
 target_link_libraries(${CMAKE_PROJECT_NAME}
         android
         log
-        GlossHook::GlossHook
+        dl
 )
