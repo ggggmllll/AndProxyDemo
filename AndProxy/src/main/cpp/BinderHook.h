@@ -73,7 +73,8 @@ private:
     // 缓存：handle -> 服务名
     std::map<uint32_t, std::string> serviceCache_;
     // 缓存：code -> 方法名
-    std::map<int, std::string> methodCache_;
+    std::map<std::string, std::map<int, std::string>> methodCache_;
+    std::mutex methodCacheMutex_;   // 新增互斥锁
 
     // 统一回调映射（key = (isBefore ? "before#" : "after#") + serviceName + "#" + methodName）
     std::map<std::string, BinderNativeCallback> callbacks_;

@@ -367,10 +367,17 @@ bool BinderHook::invokeJavaCallback(binder_transaction_data* txn, bool isReply,
         }
 
         std::string methodName;
-        auto itMethod = methodCache_.find(txn->code);
-        if (itMethod != methodCache_.end()) {
-            methodName = itMethod->second;
-        } else {
+        {
+            std::lock_guard<std::mutex> lock(methodCacheMutex_);
+            auto itService = methodCache_.find(serverName);
+            if (itService != methodCache_.end()) {
+                auto itCode = itService->second.find(txn->code);
+                if (itCode != itService->second.end()) {
+                    methodName = itCode->second;
+                }
+            }
+        }
+        if (methodName.empty()) {
             std::string serverClass = dotted_to_slash(serverName) + "$Stub";
             JNIEnv* env = nullptr;
             bool needDetach = false;
@@ -378,16 +385,21 @@ bool BinderHook::invokeJavaCallback(binder_transaction_data* txn, bool isReply,
                 jvm_->AttachCurrentThread(&env, nullptr);
                 needDetach = true;
             }
+
             methodName = get_transaction_name(env, serverClass.c_str(), txn->code);
             if (needDetach) jvm_->DetachCurrentThread();
+
+            // 3. 解析成功则写入缓存（加写锁）
             if (!methodName.empty()) {
-                methodCache_[txn->code] = methodName;
+                std::lock_guard<std::mutex> lock(methodCacheMutex_);
+                methodCache_[serverName][txn->code] = methodName;
             }
         }
         if (methodName.empty()) {
-            LOGD("Empty method name for code %u", txn->code);
+            //LOGD("serverName: %s, Empty method name for code %u", serverName.c_str(), txn->code);
             return false;
         }
+        LOGD("serverName: %s, Method name: %s, txn code: %d", serverName.c_str(), methodName.c_str(), txn->code);
 
         // 保存到线程局部存储
         txnContext_.serviceName = serverName;
