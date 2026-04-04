@@ -5,6 +5,7 @@
 #include <elf.h>
 #include <thread>
 #include <utility>
+#include <vector>
 #include <sys/mman.h>
 #include <bits/sysconf.h>
 
@@ -378,7 +379,7 @@ bool BinderHook::invokeJavaCallback(binder_transaction_data* txn, bool isReply,
             }
         }
         if (methodName.empty()) {
-            std::string serverClass = dotted_to_slash(serverName) + "$Stub";
+            std::string slashName = dotted_to_slash(serverName);
             JNIEnv* env = nullptr;
             bool needDetach = false;
             if (jvm_->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
@@ -386,7 +387,19 @@ bool BinderHook::invokeJavaCallback(binder_transaction_data* txn, bool isReply,
                 needDetach = true;
             }
 
-            methodName = get_transaction_name(env, serverClass.c_str(), txn->code);
+            std::vector<std::string> classes_to_try = {
+                slashName + "$Stub",
+                slashName,
+                "android/content/ContentProviderNative"
+            };
+
+            for (const auto& cls : classes_to_try) {
+                methodName = get_transaction_name(env, cls.c_str(), txn->code);
+                if (!methodName.empty()) {
+                    break;
+                }
+            }
+
             if (needDetach) jvm_->DetachCurrentThread();
 
             // 3. 解析成功则写入缓存（加写锁）

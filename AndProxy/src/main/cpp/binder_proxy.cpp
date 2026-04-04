@@ -1,4 +1,7 @@
+#include <cctype>
 #include <cstring>
+#include <string>
+#include <vector>
 #include <malloc.h>
 #include <android/api-level.h>
 #include "binder_proxy.h"
@@ -196,7 +199,10 @@ std::string get_transaction_name(JNIEnv* env, const char* class_name, int code) 
 
         // 匹配前缀 "TRANSACTION_"
         const char* prefix = "TRANSACTION_";
-        if (strncmp(name, prefix, 12) == 0) {
+        const char* suffix = "_TRANSACTION";
+        size_t nameLen = strlen(name);
+        
+        if (nameLen > 12 && strncmp(name, prefix, 12) == 0) {
             jfieldID fieldID = env->GetStaticFieldID(targetClass, name, "I");
             if (fieldID != nullptr) {
                 jint value = env->GetStaticIntField(targetClass, fieldID);
@@ -209,6 +215,24 @@ std::string get_transaction_name(JNIEnv* env, const char* class_name, int code) 
                 }
             } else {
                 env->ExceptionClear();  // 清除可能的异常
+            }
+        } else if (nameLen > 12 && strcmp(name + nameLen - 12, suffix) == 0) {
+            jfieldID fieldID = env->GetStaticFieldID(targetClass, name, "I");
+            if (fieldID != nullptr) {
+                jint value = env->GetStaticIntField(targetClass, fieldID);
+                if (value == code) {
+                    result = std::string(name, nameLen - 12);
+                    // 转小写，因为 _TRANSACTION 通常全大写，如 CALL_TRANSACTION -> call
+                    for (char& c : result) {
+                        c = std::tolower(c);
+                    }
+                    env->ReleaseStringUTFChars(nameStr, name);
+                    env->DeleteLocalRef(nameStr);
+                    env->DeleteLocalRef(field);
+                    break;
+                }
+            } else {
+                env->ExceptionClear();
             }
         }
 

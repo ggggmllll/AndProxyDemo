@@ -20,6 +20,35 @@ public class CacheHandling {
      */
     public static void clearCaches() {
         clearPackageInfoCache();
+        clearSettingsCache();
+    }
+
+    /**
+     * 清理Settings的缓存
+     * 清除Settings.Secure对系统设置的缓存，确保Android ID等修改能够立即生效
+     */
+    private static void clearSettingsCache() {
+        try {
+            Class<?> secureClass = android.provider.Settings.Secure.class;
+            Field cacheField = findFieldRecursively(secureClass, "sNameValueCache");
+            Object cacheInstance = cacheField.get(null);
+
+            if (cacheInstance != null) {
+                try {
+                    cacheInstance.getClass().getMethod("clear").invoke(cacheInstance);
+                } catch (Throwable e) {
+                    // 如果 clear 不存在，尝试清除 mValues
+                    Field mValuesField = findFieldRecursively(cacheInstance.getClass(), "mValues");
+                    Object values = mValuesField.get(cacheInstance);
+                    if (values instanceof Map) {
+                        ((Map<?, ?>) values).clear();
+                    } else if (values != null) {
+                        values.getClass().getMethod("clear").invoke(values);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     /**

@@ -4,6 +4,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -22,6 +23,12 @@ class MainActivity : ComponentActivity() {
 
     // 用于存储显示的结果
     private var resultText by mutableStateOf("未检测")
+    private var resultTextAndroidId by mutableStateOf("未检测")
+
+    companion object {
+        private val isAndroidIdRequest = ThreadLocal<Boolean>()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         HiddenApiBypass.addHiddenApiExemptions("")
@@ -42,6 +49,18 @@ class MainActivity : ComponentActivity() {
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(onClick = { enableFraud() }) {
                         Text("启用欺诈")
+                    }
+
+                    Spacer(modifier = Modifier.height(32.dp))
+
+                    Text(text = resultTextAndroidId, style = MaterialTheme.typography.headlineSmall)
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Button(onClick = { checkRealAndroidId() }) {
+                        Text("检测真实Android ID")
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(onClick = { enableAndroidIdFraud() }) {
+                        Text("启用Android ID欺诈")
                     }
                 }
             }
@@ -128,5 +147,84 @@ class MainActivity : ComponentActivity() {
             e.printStackTrace()
             false
         }
+    }
+
+    private fun checkRealAndroidId() {
+        BinderDispatcher.unregisterBefore("android.content.IContentProvider", "call")
+        BinderDispatcher.unregisterAfter("android.content.IContentProvider", "call")
+        CacheHandling.clearCaches()
+
+        val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+        resultTextAndroidId = "真实Android ID: $androidId"
+    }
+
+    private fun enableAndroidIdFraud() {
+        // 先注销已有的拦截器
+        BinderDispatcher.unregisterBefore("android.content.IContentProvider", "call")
+        BinderDispatcher.unregisterAfter("android.content.IContentProvider", "call")
+        CacheHandling.clearCaches()
+
+        // 1. 注册 before 回调，识别是否为获取 Android ID 的请求
+        BinderDispatcher.registerBefore(
+            "android.content.IContentProvider",
+            "call",
+            BinderInterceptor { data, _ ->
+                try {
+                    // 读取 Interface Token
+                    data.enforceInterface("android.content.IContentProvider")
+
+                    // 判断是否为获取 Android ID 的请求
+                    val bytes = data.marshall()
+                    val str16 = String(bytes, Charsets.UTF_16LE)
+                    val str8 = String(bytes, Charsets.UTF_8)
+                    
+                    if ((str16.contains("GET_secure") || str8.contains("GET_secure")) && 
+                        (str16.contains("android_id") || str8.contains("android_id"))) {
+                        isAndroidIdRequest.set(true)
+                        Log.d("Bypass", "Intercepted Android ID request!")
+                    } else {
+                        isAndroidIdRequest.set(false)
+                    }
+                } catch (e: Exception) {
+                    isAndroidIdRequest.set(false)
+                }
+                false
+            }
+        )
+
+        // 2. 注册 after 回调，修改服务端返回的 Bundle
+        BinderDispatcher.registerAfter(
+            "android.content.IContentProvider",
+            "call",
+            BinderInterceptor { data, outReply ->
+                if (isAndroidIdRequest.get() == true) {
+                    isAndroidIdRequest.remove()
+
+                    try {
+                        data.readException()
+
+                        val bundle = data.readBundle()
+                        if (bundle != null) {
+                            Log.d("Bypass", "Original Android ID: ${bundle.getString("value")}")
+
+                            bundle.putString("value", "8888888888888888")
+
+                            outReply.setDataPosition(0)
+                            outReply.writeNoException()
+                            outReply.writeBundle(bundle)
+
+                            Log.d("Bypass", "Android ID modified successfully!")
+                            return@BinderInterceptor true
+                        }
+                    } catch (e: Exception) {
+                        Log.e("Bypass", "Failed to modify Android ID", e)
+                    }
+                }
+                false
+            }
+        )
+
+        val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+        resultTextAndroidId = "欺诈后Android ID: $androidId"
     }
 }
