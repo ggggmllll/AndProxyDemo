@@ -1,5 +1,6 @@
 #include <cctype>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 #include <malloc.h>
@@ -136,96 +137,112 @@ size_t get_cmd_data_size(uint32_t cmd, int is_read) {
 //    }
 //}
 
-std::string get_transaction_name(JNIEnv* env, const char* class_name, int code) {
-    std::string result;
 
-    // 类名合法性检查：只允许字母、数字、'/','$','_'
+static const std::map<std::string, std::map<int, std::string>> special_maps = {
+        {
+                "android/content/IContentProvider",
+                {
+                        {1, "query"}, {2, "getType"}, {3, "insert"}, {4, "delete"},
+                        {10, "update"}, {13, "bulkInsert"}, {14, "openFile"}, {15, "openAssetFile"},
+                        {20, "applyBatch"}, {21, "call"}, {22, "getStreamTypes"}, {23, "openTypedAssetFile"},
+                        {24, "createCancellationSignal"}, {25, "canonicalize"}, {26, "uncanonicalize"},
+                        {27, "refresh"}, {28, "checkUriPermission"}, {29, "getTypeAsync"},
+                        {30, "canonicalizeAsync"}, {31, "uncanonicalizeAsync"}, {32, "getTypeAnonymousAsync"}
+                }
+        }
+        // 可继续添加其他服务
+};
+
+std::string get_transaction_name(JNIEnv* env, const char* class_name, int code) {
+    // 类名合法性检查
     auto is_valid_class_name = [](const char* name) -> bool {
         if (!name || *name == '\0') return false;
         for (const char* p = name; *p; ++p) {
             unsigned char ch = *p;
-            if (ch <= 0x20 || ch == ':' || ch == ';' || ch == '[' || ch == '(' || ch == ')') {
+            if (ch <= 0x20 || ch == ':' || ch == ';' || ch == '[' || ch == '(' || ch == ')')
                 return false;
-            }
             if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-                  (ch >= '0' && ch <= '9') || ch == '/' || ch == '$' || ch == '_')) {
+                  (ch >= '0' && ch <= '9') || ch == '/' || ch == '$' || ch == '_'))
                 return false;
-            }
         }
         return true;
     };
 
-    if (!is_valid_class_name(class_name)) {
-        return result;
+    if (!is_valid_class_name(class_name)) return {};
+
+    auto it_special = special_maps.find(class_name);
+    if (it_special != special_maps.end()) {
+        auto it_code = it_special->second.find(code);
+        if (it_code != it_special->second.end()) {
+            LOGD("Special map hit: %s -> %s (code %d)", class_name, it_code->second.c_str(), code);
+            return it_code->second;
+        }
     }
 
+    // ---------- 通用反射查找（原有逻辑，无验证） ----------
     jclass targetClass = env->FindClass(class_name);
     if (targetClass == nullptr) {
-        env->ExceptionClear();  // 清除异常，避免崩溃
-        return result;
+        env->ExceptionClear();
+        return {};
     }
 
-    // 获取所有声明的字段
     jclass classClass = env->FindClass("java/lang/Class");
     jmethodID getDeclaredFields = env->GetMethodID(classClass, "getDeclaredFields", "()[Ljava/lang/reflect/Field;");
-    jobjectArray fields = static_cast<jobjectArray>(env->CallObjectMethod(targetClass, getDeclaredFields));
+    jobjectArray fields = (jobjectArray)env->CallObjectMethod(targetClass, getDeclaredFields);
     env->DeleteLocalRef(classClass);
     if (fields == nullptr) {
         env->DeleteLocalRef(targetClass);
-        return result;
+        return {};
     }
 
+    std::string result;
     jsize len = env->GetArrayLength(fields);
     for (jsize i = 0; i < len; ++i) {
         jobject field = env->GetObjectArrayElement(fields, i);
-        if (field == nullptr) continue;
+        if (!field) continue;
 
-        // 获取字段名
         jclass fieldClass = env->GetObjectClass(field);
         jmethodID getName = env->GetMethodID(fieldClass, "getName", "()Ljava/lang/String;");
-        jstring nameStr = static_cast<jstring>(env->CallObjectMethod(field, getName));
+        jstring nameStr = (jstring)env->CallObjectMethod(field, getName);
         env->DeleteLocalRef(fieldClass);
-        if (nameStr == nullptr) {
+        if (!nameStr) {
             env->DeleteLocalRef(field);
             continue;
         }
 
         const char* name = env->GetStringUTFChars(nameStr, nullptr);
-        if (name == nullptr) {
+        if (!name) {
             env->DeleteLocalRef(nameStr);
             env->DeleteLocalRef(field);
             continue;
         }
 
-        // 匹配前缀 "TRANSACTION_"
-        const char* prefix = "TRANSACTION_";
-        const char* suffix = "_TRANSACTION";
         size_t nameLen = strlen(name);
-        
+        // 匹配 "TRANSACTION_xxx"
+        const char* prefix = "TRANSACTION_";
         if (nameLen > 12 && strncmp(name, prefix, 12) == 0) {
             jfieldID fieldID = env->GetStaticFieldID(targetClass, name, "I");
-            if (fieldID != nullptr) {
+            if (fieldID) {
                 jint value = env->GetStaticIntField(targetClass, fieldID);
                 if (value == code) {
-                    result = name + 12;   // 去掉前缀
+                    result = name + 12;   // 去掉 "TRANSACTION_"
                     env->ReleaseStringUTFChars(nameStr, name);
                     env->DeleteLocalRef(nameStr);
                     env->DeleteLocalRef(field);
                     break;
                 }
             } else {
-                env->ExceptionClear();  // 清除可能的异常
+                env->ExceptionClear();
             }
-        } else if (nameLen > 12 && strcmp(name + nameLen - 12, suffix) == 0) {
+        }
+            // 匹配 "xxx_TRANSACTION"
+        else if (nameLen > 12 && strcmp(name + nameLen - 12, "_TRANSACTION") == 0) {
             jfieldID fieldID = env->GetStaticFieldID(targetClass, name, "I");
-            if (fieldID != nullptr) {
+            if (fieldID) {
                 jint value = env->GetStaticIntField(targetClass, fieldID);
                 if (value == code) {
                     result = std::string(name, nameLen - 12);
-                    // 转小写，因为 _TRANSACTION 通常全大写，如 CALL_TRANSACTION -> call
-                    for (char& c : result) {
-                        c = std::tolower(c);
-                    }
+                    for (char& c : result) c = std::tolower(c);
                     env->ReleaseStringUTFChars(nameStr, name);
                     env->DeleteLocalRef(nameStr);
                     env->DeleteLocalRef(field);
@@ -251,14 +268,14 @@ std::string get_server_name(const binder_transaction_data* txn) {
         return "";
     }
 
-    const uint8_t* base = reinterpret_cast<const uint8_t*>(
+    const auto* base = reinterpret_cast<const uint8_t*>(
             static_cast<uintptr_t>(txn->data.ptr.buffer));
     size_t size = txn->data_size;
 
     // 辅助函数：从给定位置提取 UTF-16 字符串
     auto extract_utf16 = [&](size_t offset, int32_t len) -> std::string {
         if (offset + 4 + len * 2 > size) return "";
-        const uint16_t* name16 = reinterpret_cast<const uint16_t*>(base + offset + 4);
+        const auto* name16 = reinterpret_cast<const uint16_t*>(base + offset + 4);
         std::string result;
         result.reserve(len);
         for (int32_t i = 0; i < len; ++i) {
@@ -280,13 +297,12 @@ std::string get_server_name(const binder_transaction_data* txn) {
     // 服务名合法性检查：只允许字母、数字、点、下划线、美元符号
     auto is_valid_name = [](const std::string& s) -> bool {
         if (s.empty()) return false;
-        for (char c : s) {
-            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                  (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '$')) {
-                return false;
-            }
-        }
-        return true;
+        return std::all_of(s.begin(), s.end(), [](char c) {
+            return (c >= 'a' && c <= 'z') ||
+                   (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') ||
+                   c == '.' || c == '_' || c == '$';
+        });
     };
 
     // 首先寻找 "TSYS" 标志（flat_binder_object.hdr.type == BINDER_TYPE_BINDER）
@@ -308,13 +324,13 @@ std::string get_server_name(const binder_transaction_data* txn) {
 
     // 回退到模糊搜索
     for (size_t offset = 0; offset + 6 <= size; ++offset) {
-        const int32_t* len_ptr = reinterpret_cast<const int32_t*>(base + offset);
+        const auto* len_ptr = reinterpret_cast<const int32_t*>(base + offset);
         int32_t nameLen = *len_ptr;
         if (nameLen <= 3 || nameLen > 256) continue;
         size_t str_bytes = static_cast<size_t>(nameLen) * 2;
         if (offset + 4 + str_bytes > size) continue;
 
-        const uint16_t* name16 = reinterpret_cast<const uint16_t*>(base + offset + 4);
+        const auto* name16 = reinterpret_cast<const uint16_t*>(base + offset + 4);
         bool valid = true;
         for (int32_t i = 0; i < nameLen; ++i) {
             uint16_t ch = name16[i];

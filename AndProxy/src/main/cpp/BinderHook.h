@@ -1,23 +1,19 @@
-//
-// Created by lenovo on 2026/3/24.
-//
-
-#ifndef JVMTI_HOOK_BINDERHOOK_H
-#define JVMTI_HOOK_BINDERHOOK_H
+#ifndef HOOK_BINDERHOOK_H
+#define HOOK_BINDERHOOK_H
 
 #include <jni.h>
 #include <mutex>
 #include <map>
 #include <string>
+#include <functional>
+#include <vector>
 #include "binder_proxy.h"  // 包含 binder 结构定义
 
-// Native 回调函数原型
+// Native 回调函数原型（不再需要提供 offsets，框架自动重建）
 using BinderNativeCallback = std::function<bool(binder_transaction_data* txn,
                                                 bool isReply,
                                                 uint8_t** outData,
-                                                size_t* outDataSize,
-                                                uint8_t** outOffsets,
-                                                binder_size_t* outOffsetsSize)>;
+                                                size_t* outDataSize)>;
 
 class BinderHook {
 public:
@@ -40,14 +36,13 @@ private:
     BinderHook() = default;
     ~BinderHook();
 
-    bool invokeJavaCallback(binder_transaction_data* txn, bool isReply,
-                            uint8_t** outData, size_t* outDataSize,
-                            uint8_t** outOffsets, binder_size_t* outOffsetsSize);
+    // 统一的回调调用入口（替代原来的 invokeJavaCallback）
+    bool invokeCallback(binder_transaction_data* txn, bool isReply,
+                        uint8_t** outData, size_t* outDataSize);
 
-    static void adjust_offsets(binder_transaction_data* txn, int delta);
-    bool replace_transaction_data(binder_transaction_data* txn,
-                                  const uint8_t* newData, size_t newDataSize,
-                                  const uint8_t* newOffsets, binder_size_t newOffsetsSize);
+    // 替换事务数据并自动重建 offsets
+    bool replace_transaction_data_with_rebuild(binder_transaction_data* txn,
+                                               const uint8_t* newData, size_t newDataSize);
 
     void process_write_commands(struct binder_write_read* bwr);
     void process_read_commands(struct binder_write_read* bwr);
@@ -72,9 +67,9 @@ private:
 
     // 缓存：handle -> 服务名
     std::map<uint32_t, std::string> serviceCache_;
-    // 缓存：code -> 方法名
+    // 缓存：服务名 -> (code -> 方法名)
     std::map<std::string, std::map<int, std::string>> methodCache_;
-    std::mutex methodCacheMutex_;   // 新增互斥锁
+    std::mutex methodCacheMutex_;
 
     // 统一回调映射（key = (isBefore ? "before#" : "after#") + serviceName + "#" + methodName）
     std::map<std::string, BinderNativeCallback> callbacks_;
@@ -83,9 +78,7 @@ private:
     // 封装 JNI 调用 Java 分派函数
     bool callJavaDispatcher(const std::string& serverName, const std::string& methodName,
                             bool isBefore, binder_transaction_data* txn,
-                            uint8_t** outData, size_t* outDataSize,
-                            uint8_t** outOffsets, binder_size_t* outOffsetsSize);
+                            uint8_t** outData, size_t* outDataSize);
 };
 
-
-#endif //JVMTI_HOOK_BINDERHOOK_H
+#endif //HOOK_BINDERHOOK_H
