@@ -50,66 +50,41 @@ static int get_api_level() {
     return 0;
 }
 
-/**
- * 试探法从 BpBinder* 中提取 handle 值
- * @param bpBinder  指向 BpBinder 对象的指针
- * @return handle 值，失败返回 -1
- */
-static int32_t extract_handle_heuristic(void* bpBinder) {
-    if (!bpBinder) return -1;
-
-    int api = get_api_level();
-    LOGD("extract_handle_heuristic: API level = %d", api);
-
-    // 基础候选集（按理论布局排列）
-    std::vector<int32_t> offsets;
-
-    // 根据 API Level 添加优先偏移
-    if (api >= 33) {          // Android 13+
-        offsets = {16, 40};
-    } else if (api >= 1) {    // Android 11 及以下（含未知 API）
-        offsets = {8, 32};
-    } else {
-        // 完全未知 API，尝试所有可能
-        offsets = {8, 16, 32, 40, 24, 28, 36, 44};
+// 从 BpBinder* 中提取 handle 值
+int32_t nativeExtractHandle(void* bpBinderPtr) {
+    if (!bpBinderPtr) {
+        LOGE("nativeExtractHandle: null pointer");
+        return -1;
     }
 
-    // 去重（可选，但直接遍历即可）
-    for (int32_t offset : offsets) {
-        if (offset < 0 || offset > 128) continue;
-
-        int32_t val = *reinterpret_cast<int32_t*>(static_cast<char*>(bpBinder) + offset);
-
-        if (val > 0 && val < 256) {
-            LOGD("extract_handle_heuristic: found plausible handle %d at offset %d (API %d)",
-                 val, offset, api);
-            return val;
+    // 1. 优先尝试符号调用（如果存在）
+    uintptr_t debugHandleAddr = elf_find_symbol("libbinder.so",
+                                                "_ZNK7android8BpBinder20getDebugBinderHandleEv");
+    if (debugHandleAddr) {
+        using GetDebugHandle = std::optional<int32_t> (*)(void*);
+        auto func = reinterpret_cast<GetDebugHandle>(debugHandleAddr);
+        auto opt = func(bpBinderPtr);
+        if (opt.has_value()) {
+            LOGD("nativeExtractHandle: via getDebugBinderHandle = %d", opt.value());
+            return opt.value();
         }
     }
 
-    LOGE("extract_handle_heuristic: no plausible handle found (API %d)", api);
-    return -1;
-}
+    // 2. 回退：精确偏移量（基于虚继承布局的实测结果）
+    int api = get_api_level();
+    size_t offset;
+    if (api >= 33) {          // Android 13+
+        offset = 16;
+    } else if (api > 0) {     // Android 2 ~ 12
+        offset = 8;
+    } else {
+        LOGE("nativeExtractHandle: unknown API level, fallback to 8");
+        offset = 8;
+    }
 
-// 从 BpBinder* 中提取 handle 值
-int32_t nativeExtractHandle(void* bpBinderPtr) {
-    if (!bpBinderPtr) return -1;
-
-    // 1. 优先尝试符号调用（如果存在）
-//    uintptr_t debugHandleAddr = elf_find_symbol("libbinder.so",
-//                                                "_ZNK7android8BpBinder20getDebugBinderHandleEv");
-//    if (debugHandleAddr) {
-//        using GetDebugHandle = std::optional<int32_t> (*)(void*);
-//        auto func = reinterpret_cast<GetDebugHandle>(debugHandleAddr);
-//        auto opt = func(bpBinderPtr);
-//        if (opt.has_value()) {
-//            LOGD("nativeExtractHandle: via getDebugBinderHandle = %d", opt.value());
-//            return opt.value();
-//        }
-//    }
-
-    // 2. 回退：多偏移量试探
-    return extract_handle_heuristic(bpBinderPtr);
+    int32_t handle = *reinterpret_cast<int32_t*>(static_cast<char*>(bpBinderPtr) + offset);
+    LOGD("nativeExtractHandle: via offset %zu (API %d) = %d", offset, api, handle);
+    return (handle > 0 && handle < 256) ? handle : -1;
 }
 
 extern "C"
