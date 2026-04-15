@@ -24,6 +24,7 @@ class MainActivity : ComponentActivity() {
     // 用于存储显示的结果
     private var resultText by mutableStateOf("未检测")
     private var resultTextAndroidId by mutableStateOf("未检测")
+    private var serviceHandleResult by mutableStateOf("未获取")
 
     companion object {
         private val isAndroidIdRequest = ThreadLocal<Boolean>()
@@ -58,12 +59,28 @@ class MainActivity : ComponentActivity() {
                     Button(onClick = { checkRealAndroidId() }) {
                         Text("检测真实Android ID")
                     }
+
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(onClick = { enableAndroidIdFraud() }) {
                         Text("启用Android ID欺诈")
                     }
+                    Spacer(modifier = Modifier.height(32.dp))
+                    Text(text = "Service Handle: $serviceHandleResult")
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Button(onClick = { fetchServiceHandle() }) {
+                        Text("获取 media.player Handle")
+                    }
                 }
             }
+        }
+    }
+
+    private fun fetchServiceHandle() {
+        val handle = BinderProxy.getServiceHandle("media.player")
+        serviceHandleResult = if (handle >= 0) {
+            "handle = $handle"
+        } else {
+            "获取失败 (handle = $handle)"
         }
     }
 

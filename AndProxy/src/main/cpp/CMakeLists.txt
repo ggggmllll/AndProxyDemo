@@ -8,6 +8,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         binder_proxy.cpp
         BinderHook.cpp
         BinderProxy.cpp
+        elf_utils.cpp
 )
 
 target_link_libraries(${CMAKE_PROJECT_NAME}

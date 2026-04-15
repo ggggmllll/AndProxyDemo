@@ -67,77 +67,6 @@ size_t get_cmd_data_size(uint32_t cmd, int is_read) {
     }
 }
 
-//binder_transaction_data* parse_next_txn(void*& ptr, size_t& remaining, int is_read) {
-//    if (ptr == nullptr || remaining < sizeof(uint32_t))
-//        return nullptr;
-//
-//    uint32_t cmd = *reinterpret_cast<uint32_t*>(ptr);
-//    size_t data_len = get_cmd_data_size(cmd, is_read);
-//
-//    // 检查剩余空间是否足够容纳命令头 + 数据
-//    if (remaining < sizeof(uint32_t) + data_len)
-//        return nullptr;
-//
-//    // 跳过命令码
-//    ptr = static_cast<char*>(ptr) + sizeof(uint32_t);
-//    remaining -= sizeof(uint32_t);
-//
-//    if (is_read) {
-//        // 读取缓冲区命令 (BR_*)
-//        switch (cmd) {
-//            case BR_TRANSACTION: {
-//                auto* tr = reinterpret_cast<binder_transaction_data*>(ptr);
-//                ptr = static_cast<char*>(ptr) + data_len;
-//                remaining -= data_len;
-//                return tr;
-//            }
-//            case BR_TRANSACTION_SEC_CTX: {
-//                auto* sec = reinterpret_cast<binder_transaction_data_secctx*>(ptr);
-//                auto* tr = &sec->transaction_data;
-//                ptr = static_cast<char*>(ptr) + data_len;
-//                remaining -= data_len;
-//                return tr;
-//            }
-//            case BR_REPLY: {
-//                auto* tr = reinterpret_cast<binder_transaction_data*>(ptr);
-//                ptr = static_cast<char*>(ptr) + data_len;
-//                remaining -= data_len;
-//                return tr;
-//            }
-//            default:
-//                // 非事务命令：跳过数据部分
-//                ptr = static_cast<char*>(ptr) + data_len;
-//                remaining -= data_len;
-//                return nullptr;
-//        }
-//    } else {
-//        // 写入缓冲区命令 (BC_*)
-//        switch (cmd) {
-//            case BC_TRANSACTION:
-//            case BC_REPLY: {
-//                auto* tr = reinterpret_cast<binder_transaction_data*>(ptr);
-//                ptr = static_cast<char*>(ptr) + data_len;
-//                remaining -= data_len;
-//                return tr;
-//            }
-//            case BC_TRANSACTION_SG:
-//            case BC_REPLY_SG: {
-//                auto* tr_sg = reinterpret_cast<binder_transaction_data_sg*>(ptr);
-//                auto* tr = &tr_sg->transaction_data;
-//                ptr = static_cast<char*>(ptr) + data_len;
-//                remaining -= data_len;
-//                return tr;
-//            }
-//            default:
-//                // 非事务命令：跳过数据部分
-//                ptr = static_cast<char*>(ptr) + data_len;
-//                remaining -= data_len;
-//                return nullptr;
-//        }
-//    }
-//}
-
-
 static const std::map<std::string, std::map<int, std::string>> special_maps = {
         {
                 "android/content/IContentProvider",
@@ -272,7 +201,7 @@ std::string get_server_name(const binder_transaction_data* txn) {
             static_cast<uintptr_t>(txn->data.ptr.buffer));
     size_t size = txn->data_size;
 
-    // 辅助函数：从给定位置提取 UTF-16 字符串
+    // 辅助函数：从给定位置提取 UTF-16 字符串（强制要求高字节为0，即纯ASCII）
     auto extract_utf16 = [&](size_t offset, int32_t len) -> std::string {
         if (offset + 4 + len * 2 > size) return "";
         const auto* name16 = reinterpret_cast<const uint16_t*>(base + offset + 4);
@@ -280,49 +209,28 @@ std::string get_server_name(const binder_transaction_data* txn) {
         result.reserve(len);
         for (int32_t i = 0; i < len; ++i) {
             uint16_t ch = name16[i];
-            if (ch < 0x80) {
-                result.push_back(static_cast<char>(ch));
-            } else if (ch < 0x800) {
-                result.push_back(static_cast<char>(0xC0 | (ch >> 6)));
-                result.push_back(static_cast<char>(0x80 | (ch & 0x3F)));
-            } else {
-                result.push_back(static_cast<char>(0xE0 | (ch >> 12)));
-                result.push_back(static_cast<char>(0x80 | ((ch >> 6) & 0x3F)));
-                result.push_back(static_cast<char>(0x80 | (ch & 0x3F)));
-            }
+            // 关键检查：UTF-16 的高字节必须为0，否则非 ASCII 服务名（非法）
+            if ((ch & 0xFF00) != 0) return "";
+            char c = static_cast<char>(ch & 0xFF);
+            result.push_back(c);
         }
         return result;
     };
 
-    // 服务名合法性检查：只允许字母、数字、点、下划线、美元符号
+    // 服务名合法性检查：完全对齐 ServiceManager::isValidServiceName 规则
     auto is_valid_name = [](const std::string& s) -> bool {
-        if (s.empty()) return false;
-        return std::all_of(s.begin(), s.end(), [](char c) {
-            return (c >= 'a' && c <= 'z') ||
-                   (c >= 'A' && c <= 'Z') ||
-                   (c >= '0' && c <= '9') ||
-                   c == '.' || c == '_' || c == '$';
-        });
+        if (s.empty() || s.size() > 127) return false;
+        for (char c : s) {
+            if (c == '_' || c == '-' || c == '.' || c == '/') continue;
+            if (c >= 'a' && c <= 'z') continue;
+            if (c >= 'A' && c <= 'Z') continue;
+            if (c >= '0' && c <= '9') continue;
+            return false;
+        }
+        return true;
     };
 
-    // 首先寻找 "TSYS" 标志（flat_binder_object.hdr.type == BINDER_TYPE_BINDER）
-    const uint32_t TSYS_MAGIC = 0x54535953;  // "TSYS"
-    for (size_t offset = 8; offset + 8 <= size; ++offset) {
-        if (*(uint32_t*)(base + offset) == TSYS_MAGIC) {
-            size_t len_pos = offset + 4;
-            if (len_pos + 4 > size) continue;
-            int32_t nameLen = *(int32_t*)(base + len_pos);
-            if (nameLen > 3 && nameLen <= 256) {
-                std::string candidate = extract_utf16(len_pos, nameLen);
-                if (!candidate.empty() && is_valid_name(candidate) &&
-                    candidate.find('.') != std::string::npos) {
-                    return candidate;
-                }
-            }
-        }
-    }
-
-    // 回退到模糊搜索
+    // 回退到模糊搜索：直接按长度字段尝试
     for (size_t offset = 0; offset + 6 <= size; ++offset) {
         const auto* len_ptr = reinterpret_cast<const int32_t*>(base + offset);
         int32_t nameLen = *len_ptr;
@@ -334,19 +242,23 @@ std::string get_server_name(const binder_transaction_data* txn) {
         bool valid = true;
         for (int32_t i = 0; i < nameLen; ++i) {
             uint16_t ch = name16[i];
-            if ((ch & 0xFF00) == 0) {
-                uint8_t lo = ch & 0xFF;
-                if (lo < 0x20 || lo > 0x7E) {
-                    valid = false;
-                    break;
-                }
+            // 必须为 ASCII 范围（高字节0，低字节可打印）
+            if ((ch & 0xFF00) != 0) {
+                valid = false;
+                break;
+            }
+            uint8_t lo = ch & 0xFF;
+            // 可选进一步限制可打印字符，但最终合法性由 is_valid_name 把关
+            if (lo < 0x20 || lo > 0x7E) {
+                valid = false;
+                break;
             }
         }
         if (!valid) continue;
 
-        std::string result = extract_utf16(offset, nameLen);
-        if (is_valid_name(result)) {
-            return result;
+        std::string candidate = extract_utf16(offset, nameLen);
+        if (is_valid_name(candidate)) {
+            return candidate;
         }
     }
 

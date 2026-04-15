@@ -1,8 +1,8 @@
 #include "BinderHook.h"
 #include "binder_proxy.h"
 #include "log.h"
+#include "elf_utils.h"
 
-#include <elf.h>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -28,96 +28,13 @@ BinderHook::~BinderHook() {
     addrMap_.clear();
 }
 
-// ==================== GOT Hook 相关函数（保持不变） ====================
-static uintptr_t get_library_base(const char *libname) {
-    char line[512];
-    FILE *fp = fopen("/proc/self/maps", "r");
-    if (!fp) {
-        LOGE("Failed to open /proc/self/maps: %s", strerror(errno));
-        return 0;
-    }
-    uintptr_t base = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        char *path = strchr(line, '/');
-        if (path && strstr(path, libname)) {
-            char *dash = strchr(line, '-');
-            if (dash) {
-                *dash = '\0';
-                base = strtoull(line, nullptr, 16);
-                LOGD("Found library %s at base 0x%lx", libname, base);
-                break;
-            }
-        }
-    }
-    fclose(fp);
-    return base;
-}
-
-static uintptr_t get_dynamic_info_offset(const Elf64_Dyn *dyn, int64_t tag) {
-    for (; dyn->d_tag != DT_NULL; ++dyn) {
-        if (dyn->d_tag == tag) return dyn->d_un.d_ptr;
-    }
-    return 0;
-}
-
-static uintptr_t find_got_entry(const char *libname, const char *funcname) {
-    uintptr_t base = get_library_base(libname);
-    if (!base) return 0;
-    auto *ehdr = (Elf64_Ehdr*)base;
-    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 || ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
-        ehdr->e_ident[EI_MAG2] != ELFMAG2 || ehdr->e_ident[EI_MAG3] != ELFMAG3) {
-        LOGE("Invalid ELF header");
-        return 0;
-    }
-    auto *phdr = (Elf64_Phdr*)(base + ehdr->e_phoff);
-    Elf64_Dyn *dyn = nullptr;
-    for (int i = 0; i < ehdr->e_phnum; ++i) {
-        if (phdr[i].p_type == PT_DYNAMIC) {
-            dyn = (Elf64_Dyn*)(base + phdr[i].p_vaddr);
-            break;
-        }
-    }
-    if (!dyn) return 0;
-    uintptr_t symtab_off = get_dynamic_info_offset(dyn, DT_SYMTAB);
-    uintptr_t strtab_off = get_dynamic_info_offset(dyn, DT_STRTAB);
-    uintptr_t relplt_off = get_dynamic_info_offset(dyn, DT_JMPREL);
-    size_t relplt_size = get_dynamic_info_offset(dyn, DT_PLTRELSZ);
-    if (!symtab_off || !strtab_off || !relplt_off || !relplt_size) return 0;
-    auto *symtab = (Elf64_Sym*)(base + symtab_off);
-    const char *strtab = (const char*)(base + strtab_off);
-    auto *relplt = (Elf64_Rela*)(base + relplt_off);
-    size_t num_rel = relplt_size / sizeof(Elf64_Rela);
-    for (size_t i = 0; i < num_rel; ++i) {
-        uint32_t sym_idx = ELF64_R_SYM(relplt[i].r_info);
-        const char *sym_name = strtab + symtab[sym_idx].st_name;
-        if (strcmp(sym_name, funcname) == 0) {
-            return base + relplt[i].r_offset;
-        }
-    }
-    return 0;
-}
-
-static void got_hook(uintptr_t got_addr, void *new_func, void **old_func) {
-    void **got_ptr = (void**)got_addr;
-    void *orig = *got_ptr;
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) return;
-    uintptr_t page_start = got_addr & ~(page_size - 1);
-    if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE) == -1) return;
-    *got_ptr = new_func;
-    if (mprotect((void*)page_start, page_size, PROT_READ) == -1) {
-        // ignore
-    }
-    if (old_func) *old_func = orig;
-}
-
 void BinderHook::init(JavaVM* vm) {
-    uintptr_t got_entry = find_got_entry("libbinder.so", "ioctl");
+    uintptr_t got_entry = elf_find_got_entry("libbinder.so", "ioctl");
     if (!got_entry) {
         LOGE("Failed to find GOT entry for ioctl");
         return;
     }
-    got_hook(got_entry, (void*)ioctl_proxy, nullptr);
+    elf_got_hook(got_entry, (void*)ioctl_proxy, nullptr);
     jvm_ = vm;
     JNIEnv* env;
     if (jvm_->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
